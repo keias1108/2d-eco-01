@@ -5,84 +5,85 @@ import { Grazer, Hunter } from "./creature.js";
 
 const sketch = (p) => {
   let world;
-  let grazers = [];
-  let hunters = [];
-  let qtree;
+  let creatures = [];
 
   p.setup = function () {
-    // p.createCanvas가 반환한 렌더러를 직접 사용하지 않고,
-    // new p5() 생성자의 두 번째 인자로 부모 요소를 전달합니다.
     p.createCanvas(window.innerWidth * 0.9, window.innerHeight * 0.9);
     world = new World(p, p.width, p.height);
 
     for (let i = 0; i < CONFIG.INITIAL_GRAZERS; i++) {
-      grazers.push(new Grazer(p, p.random(p.width), p.random(p.height)));
+      creatures.push(new Grazer(p, p.random(p.width), p.random(p.height)));
     }
     for (let i = 0; i < CONFIG.INITIAL_HUNTERS; i++) {
-      hunters.push(new Hunter(p, p.random(p.width), p.random(p.height)));
+      creatures.push(new Hunter(p, p.random(p.width), p.random(p.height)));
     }
   };
 
   p.draw = function () {
+    p.background(13, 17, 23);
+
+    // --- [수정된 부분] ---
+    // 매 프레임마다 월드의 에너지 필드를 업데이트하여 동적으로 변화시킵니다.
     world.update();
+    // --- 수정 끝 ---
+
     world.display();
 
-    let boundary = new Rectangle(
+    const boundary = new Rectangle(
       p.width / 2,
       p.height / 2,
       p.width / 2,
       p.height / 2
     );
-    qtree = new Quadtree(boundary, CONFIG.QUADTREE_CAPACITY);
+    const qtree = new Quadtree(boundary, CONFIG.QUADTREE_CAPACITY);
+    for (const c of creatures) {
+      qtree.insert(new Point(c.position.x, c.position.y, c));
+    }
 
-    for (let g of grazers)
-      qtree.insert(new Point(g.position.x, g.position.y, g));
-    for (let h of hunters)
-      qtree.insert(new Point(h.position.x, h.position.y, h));
+    let newCreatures = [];
 
-    updateAndDisplay(hunters, (h) => {
-      let range = new Rectangle(
-        h.position.x,
-        h.position.y,
-        CONFIG.HUNTER.HUNT_RADIUS,
-        CONFIG.HUNTER.HUNT_RADIUS
+    for (let i = creatures.length - 1; i >= 0; i--) {
+      const creature = creatures[i];
+
+      const perceptionRadius =
+        creature instanceof Hunter
+          ? CONFIG.HUNTER.HUNT_RADIUS
+          : CONFIG.GRAZER.FLEE_RADIUS;
+      const range = new Rectangle(
+        creature.position.x,
+        creature.position.y,
+        perceptionRadius,
+        perceptionRadius
       );
-      let nearbyGrazers = qtree.query(range).filter((c) => c instanceof Grazer);
-      h.update(nearbyGrazers, hunters);
-    });
+      const neighbors = qtree.query(range);
 
-    updateAndDisplay(grazers, (g) => {
-      let range = new Rectangle(
-        g.position.x,
-        g.position.y,
-        CONFIG.GRAZER.FLEE_RADIUS,
-        CONFIG.GRAZER.FLEE_RADIUS
-      );
-      let nearbyHunters = qtree.query(range).filter((c) => c instanceof Hunter);
-      g.update(world, nearbyHunters, grazers);
-    });
+      const offspring = creature.run(neighbors, world);
+      if (offspring) {
+        newCreatures.push(offspring);
+      }
+
+      creature.display();
+
+      if (creature.isDead()) {
+        creatures.splice(i, 1);
+      }
+    }
+
+    creatures.push(...newCreatures);
 
     displayInfo();
   };
 
-  function updateAndDisplay(agentArray, updateLogic) {
-    for (let i = agentArray.length - 1; i >= 0; i--) {
-      let agent = agentArray[i];
-      updateLogic(agent);
-      agent.display();
-      if (agent.isDead()) {
-        agentArray.splice(i, 1);
-      }
-    }
-  }
-
   function displayInfo() {
+    const grazerCount = creatures.filter((c) => c instanceof Grazer).length;
+    const hunterCount = creatures.filter((c) => c instanceof Hunter).length;
     p.noStroke();
     p.fill(200);
     p.textSize(16);
-    p.text(`Grazers: ${grazers.length}`, 10, 20);
-    p.text(`Hunters: ${hunters.length}`, 10, 40);
-    p.text(`FPS: ${p.floor(p.frameRate())}`, 10, 60);
+    p.text(`Total: ${creatures.length}`, 10, 20);
+    p.text(`Grazers: ${grazerCount}`, 10, 40);
+    p.text(`Hunters: ${hunterCount}`, 10, 60);
+    p.text(`FPS: ${p.floor(p.frameRate())}`, 10, 80);
   }
 
   p.mousePressed = function () {
@@ -93,21 +94,12 @@ const sketch = (p) => {
       p.mouseY < p.height
     ) {
       if (p.keyIsDown(p.SHIFT)) {
-        hunters.push(new Hunter(p, p.mouseX, p.mouseY));
+        creatures.push(new Hunter(p, p.mouseX, p.mouseY));
       } else {
-        for (let i = 0; i < 5; i++) {
-          grazers.push(
-            new Grazer(
-              p,
-              p.mouseX + p.random(-10, 10),
-              p.mouseY + p.random(-10, 10)
-            )
-          );
-        }
+        creatures.push(new Grazer(p, p.mouseX, p.mouseY));
       }
     }
   };
 };
 
-// 'main' 태그를 찾아 그 안에 p5 캔버스를 생성합니다.
 new p5(sketch, document.querySelector("main"));
