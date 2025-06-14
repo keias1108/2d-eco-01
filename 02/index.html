@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="ko">
+  <head>
+    <title>GPGPU 기반 창발적 2차원 생태계 (최종)</title>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0"
+    />
+    <style>
+      body {
+        margin: 0;
+        padding: 0;
+        background-color: #050510;
+        color: #ffffff;
+        font-family: monospace;
+        overflow: hidden;
+      }
+      canvas {
+        display: block;
+      }
+      #info {
+        position: absolute;
+        top: 10px;
+        width: 100%;
+        text-align: center;
+        z-index: 100;
+        display: block;
+        text-shadow: 0 0 5px #000;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="info">GPGPU 기반 창발적 2차원 생태계 (512x512 = 262,144 입자)</div>
+
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.165.0/build/three.module.js",
+          "three/addons/": "https://unpkg.com/three@0.165.0/examples/jsm/"
+        }
+      }
+    </script>
+
+    <script type="module">
+      import * as THREE from "three";
+      import { GPUComputationRenderer } from "three/addons/misc/GPUComputationRenderer.js";
+
+      const WIDTH = 512;
+      const BOUNDS = 200;
+
+      let scene, camera, renderer;
+      let gpuCompute;
+      let positionVariable, velocityVariable;
+      let particleUniforms;
+      let clock = new THREE.Clock();
+      let mouse = new THREE.Vector3(9999, 9999, 0);
+
+      // ======================= FINAL SHADERS (using RawShaderMaterial) ============================
+
+      const particleVertexShader = /* glsl */ `
+            // RawShaderMaterial: We must declare EVERYTHING manually.
+            // No GLSL version directive needed, defaults to 1.00 for max compatibility.
+            
+            precision highp float;
+
+            uniform mat4 modelViewMatrix;
+            uniform mat4 projectionMatrix;
+            uniform sampler2D texturePosition;
+
+            // We declare attributes ourselves.
+            attribute vec3 position; // A dummy position attribute.
+            attribute vec2 uv;       // The UV attribute to read the texture.
+
+            void main() {
+                // Read the real position from the GPGPU texture
+                vec3 pos = texture2D(texturePosition, uv).xyz;
+                
+                // Manual MVP transformation
+                gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
+                gl_PointSize = 1.5;
+            }
+        `;
+
+      const particleFragmentShader = /* glsl */ `
+            precision highp float;
+
+            void main() {
+                if (length(gl_PointCoord - vec2(0.5)) > 0.495) discard;
+                gl_FragColor = vec4(0.6, 0.8, 1.0, 0.8);
+            }
+        `;
+
+      const positionUpdateShader = /* glsl */ `
+            uniform float u_deltaTime;
+            void main() {
+                vec2 uv = gl_FragCoord.xy / resolution.xy;
+                vec3 position = texture(texturePosition, uv).xyz;
+                vec3 velocity = texture(textureVelocity, uv).xyz;
+                position += velocity * u_deltaTime;
+                pc_fragColor = vec4(position, 1.0);
+            }
+        `;
+
+      const velocityUpdateShader = /* glsl */ `
+            uniform float u_time;
+            uniform float u_deltaTime;
+            uniform vec3 u_mouse;
+
+            vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+            vec4 mod289(vec4 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+            vec4 permute(vec4 x) { return mod289(((x*34.0)+1.0)*x); }
+            vec4 taylorInvSqrt(vec4 r) { return 1.79284291400159 - 0.85373472095314 * r; }
+            float snoise(vec3 v) {
+                const vec2 C = vec2(1.0/6.0, 1.0/3.0); const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+                vec3 i = floor(v + dot(v, C.yyy)); vec3 x0 = v - i + dot(i, C.xxx);
+                vec3 g = step(x0.yzx, x0.xyz); vec3 l = 1.0 - g; vec3 i1 = min(g.xyz, l.zxy);
+                vec3 i2 = max(g.xyz, l.zxy); vec3 x1 = x0 - i1 + C.xxx; vec3 x2 = x0 - i2 + C.yyy;
+                vec3 x3 = x0 - D.yyy; i = mod289(i);
+                vec4 p = permute(permute(permute( i.z + vec4(0.0, i1.z, i2.z, 1.0)) + i.y + vec4(0.0, i1.y, i2.y, 1.0)) + i.x + vec4(0.0, i1.x, i2.x, 1.0));
+                float n_ = 0.142857142857; vec3 ns = n_ * D.wyz - D.xzx;
+                vec4 j = p - 49.0 * floor(p * ns.z * ns.z); vec4 x_ = floor(j * ns.z);
+                vec4 y_ = floor(j - 7.0 * x_); vec4 x = x_ * ns.x + ns.yyyy; vec4 y = y_ * ns.x + ns.yyyy;
+                vec4 h = 1.0 - abs(x) - abs(y); vec4 b0 = vec4(x.xy, y.xy); vec4 b1 = vec4(x.zw, y.zw);
+                vec4 s0 = floor(b0) * 2.0 + 1.0; vec4 s1 = floor(b1) * 2.0 + 1.0; vec4 sh = -step(h, vec4(0.0));
+                vec4 a0 = b0.xzyw + s0.xzyw * sh.xxyy; vec4 a1 = b1.xzyw + s1.xzyw * sh.zzww;
+                vec3 p0 = vec3(a0.xy, h.x); vec3 p1 = vec3(a0.zw, h.y); vec3 p2 = vec3(a1.xy, h.z);
+                vec3 p3 = vec3(a1.zw, h.w); vec4 norm = taylorInvSqrt(vec4(dot(p0, p0), dot(p1, p1), dot(p2, p2), dot(p3, p3)));
+                p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+                vec4 m = max(0.6 - vec4(dot(x0, x0), dot(x1, x1), dot(x2, x2), dot(x3, x3)), 0.0);
+                m = m * m; return 42.0 * dot(m * m, vec4(dot(p0, x0), dot(p1, x1), dot(p2, x2), dot(p3, x3)));
+            }
+            float rand(vec2 co){ return fract(sin(dot(co.xy ,vec2(12.9898,78.233))) * 43758.5453); }
+
+            void main() {
+                vec2 uv = gl_FragCoord.xy / resolution.xy;
+                vec3 position = texture(texturePosition, uv).xyz;
+                vec3 velocity = texture(textureVelocity, uv).xyz;
+                vec3 acceleration = vec3(0.0);
+                float noiseScale = 0.01; float timeScaled = u_time * 0.1;
+                vec3 noisePos = position * noiseScale; float noise = snoise(vec3(noisePos.xy, timeScaled));
+                vec3 flowForce = vec3(cos(noise * 10.0), sin(noise * 10.0), 0.0) * 5.0;
+                acceleration += flowForce;
+                vec3 toCenter = -position; float distToCenter = length(toCenter);
+                if (distToCenter > 10.0) { acceleration += normalize(toCenter) * 0.5; }
+                float mouseRadius = 50.0;
+                if (u_mouse.x < 9998.0) {
+                    vec3 diffMouse = position - u_mouse; float distMouse = length(diffMouse);
+                    if (distMouse > 0.001 && distMouse < mouseRadius) {
+                        float repulsionStrength = pow(mouseRadius / distMouse, 2.0);
+                        acceleration += normalize(diffMouse) * repulsionStrength * 10.0;
+                    }
+                }
+                float separationRadius = 2.0; int neighborCount = 8;
+                for (int i = 0; i < neighborCount; i++) {
+                    vec2 randomUV = vec2(rand(uv + float(i) * 0.1), rand(uv + float(i) * 0.15 + u_time * 0.01));
+                    vec3 neighborPos = texture(texturePosition, randomUV).xyz;
+                    vec3 diffNeighbor = position - neighborPos; float distNeighbor = length(diffNeighbor);
+                    if (distNeighbor > 0.0 && distNeighbor < separationRadius) {
+                         float percent = distNeighbor / separationRadius; float F = pow(1.0 - percent, 2.0);
+                         acceleration += normalize(diffNeighbor) * F * 15.0;
+                    }
+                }
+                velocity += acceleration * u_deltaTime;
+                velocity *= 0.98;
+                if (any(isnan(velocity))) { velocity = vec3(0.0); }
+                velocity = clamp(velocity, vec3(-50.0), vec3(50.0));
+                pc_fragColor = vec4(velocity, 1.0);
+            }
+        `;
+
+      init();
+      animate();
+
+      function init() {
+        renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+        camera = new THREE.PerspectiveCamera(
+          75,
+          window.innerWidth / window.innerHeight,
+          0.1,
+          3000
+        );
+        camera.position.z = BOUNDS * 1.5;
+        scene = new THREE.Scene();
+        gpuCompute = new GPUComputationRenderer(WIDTH, WIDTH, renderer);
+        if (renderer.capabilities.isWebGL2 === false) {
+          document.getElementById("info").innerHTML =
+            "오류: 이 시뮬레이션은 WebGL2를 지원하는 브라우저가 필요합니다.";
+          return;
+        }
+        const dtPosition = gpuCompute.createTexture();
+        const dtVelocity = gpuCompute.createTexture();
+        fillPositionTexture(dtPosition);
+        fillVelocityTexture(dtVelocity);
+        velocityVariable = gpuCompute.addVariable(
+          "textureVelocity",
+          velocityUpdateShader,
+          dtVelocity
+        );
+        positionVariable = gpuCompute.addVariable(
+          "texturePosition",
+          positionUpdateShader,
+          dtPosition
+        );
+        gpuCompute.setVariableDependencies(velocityVariable, [
+          positionVariable,
+          velocityVariable,
+        ]);
+        gpuCompute.setVariableDependencies(positionVariable, [
+          positionVariable,
+          velocityVariable,
+        ]);
+        velocityVariable.material.uniforms["u_time"] = { value: 0.0 };
+        velocityVariable.material.uniforms["u_deltaTime"] = { value: 0.0 };
+        velocityVariable.material.uniforms["u_mouse"] = { value: mouse };
+        positionVariable.material.uniforms["u_deltaTime"] = { value: 0.0 };
+        const error = gpuCompute.init();
+        if (error !== null) {
+          console.error(error);
+        }
+
+        const geometry = new THREE.BufferGeometry();
+        const particleCount = WIDTH * WIDTH;
+        // RawShaderMaterial requires a 'position' attribute, even if it's just a dummy.
+        const positions = new Float32Array(particleCount * 3);
+        const uvs = new Float32Array(particleCount * 2);
+        for (let j = 0, p = 0, q = 0; j < WIDTH; j++) {
+          for (let i = 0; i < WIDTH; i++) {
+            positions[p++] = 0;
+            positions[p++] = 0;
+            positions[p++] = 0;
+            uvs[q++] = i / (WIDTH - 1);
+            uvs[q++] = j / (WIDTH - 1);
+          }
+        }
+        geometry.setAttribute(
+          "position",
+          new THREE.BufferAttribute(positions, 3)
+        );
+        geometry.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
+
+        // Use RawShaderMaterial for full control
+        particleUniforms = { texturePosition: { value: null } };
+        const material = new THREE.RawShaderMaterial({
+          uniforms: particleUniforms,
+          vertexShader: particleVertexShader,
+          fragmentShader: particleFragmentShader,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+          transparent: true,
+        });
+        const particles = new THREE.Points(geometry, material);
+        scene.add(particles);
+
+        window.addEventListener("resize", onWindowResize);
+        document.addEventListener("mousemove", onMouseMove);
+        document.addEventListener("mouseleave", onMouseLeave);
+      }
+      function animate() {
+        requestAnimationFrame(animate);
+        render();
+      }
+      function render() {
+        const deltaTime = Math.min(clock.getDelta(), 0.05);
+        const time = clock.getElapsedTime();
+        gpuCompute.compute();
+        velocityVariable.material.uniforms["u_time"].value = time;
+        velocityVariable.material.uniforms["u_deltaTime"].value = deltaTime;
+        positionVariable.material.uniforms["u_deltaTime"].value = deltaTime;
+        velocityVariable.material.uniforms["u_mouse"].value.copy(mouse);
+        particleUniforms["texturePosition"].value =
+          gpuCompute.getCurrentRenderTarget(positionVariable).texture;
+        renderer.render(scene, camera);
+      }
+      function fillPositionTexture(texture) {
+        const theArray = texture.image.data;
+        for (let i = 0; i < theArray.length; i += 4) {
+          const x = Math.random() * BOUNDS - BOUNDS / 2;
+          const y = Math.random() * BOUNDS - BOUNDS / 2;
+          theArray[i] = x;
+          theArray[i + 1] = y;
+          theArray[i + 2] = 0;
+          theArray[i + 3] = 1;
+        }
+      }
+      function fillVelocityTexture(texture) {
+        const theArray = texture.image.data;
+        for (let i = 0; i < theArray.length; i += 4) {
+          theArray[i] = 0;
+          theArray[i + 1] = 0;
+          theArray[i + 2] = 0;
+          theArray[i + 3] = 1;
+        }
+      }
+      function onWindowResize() {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      }
+      function onMouseMove(event) {
+        const rect = renderer.domElement.getBoundingClientRect();
+        const x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+        const y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+        const vec = new THREE.Vector3(x, y, 0.5);
+        vec.unproject(camera);
+        const dir = vec.sub(camera.position).normalize();
+        const distance = -camera.position.z / dir.z;
+        mouse.copy(camera.position).add(dir.multiplyScalar(distance));
+      }
+      function onMouseLeave() {
+        mouse.set(9999, 9999, 0);
+      }
+    </script>
+  </body>
+</html>
